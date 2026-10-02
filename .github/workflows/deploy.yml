@@ -1,0 +1,148 @@
+name: Deploy React site to EC2 # Workflow name shown in the Actions tab
+
+on: # Events that start the workflow
+  push: # Run when code is pushed
+    branches: [main] # Only pushes to main
+    paths: # Only when one of these files changes
+      - "src/**" # React code and src/data/profile.json
+      - "public/**" # Profile photo and other static files
+      - "index.html" # HTML entry page
+      - "package.json" # Dependencies
+      - "package-lock.json" # Locked dependency versions
+      - "vite.config.js" # Build settings
+      - "scripts/**" # Profile validation script
+      - "infra/**" # CloudFormation template
+      - ".github/workflows/deploy.yml" # This workflow file
+  workflow_dispatch: # Allow running it manually from the Actions tab
+    inputs: # Options shown when running manually
+      instance_type: # Input name
+        description: EC2 instance type # Label shown in the UI
+        default: t2.micro # Pre-selected value
+        type: choice # Shown as a dropdown
+        options: [t2.micro, t2.small, t2.medium, t3.micro, t3.small, t3.medium] # Dropdown values
+
+concurrency: deploy # Only one deploy at a time; a new push waits for the running one
+
+env: # Variables available to every step
+  AWS_REGION: us-east-1 # AWS region to deploy in (change if your sandbox uses another)
+  STACK_NAME: react-profile-stack # Name of the CloudFormation stack
+  TEMPLATE: infra/ec2-instance.yaml # Path to the CloudFormation template
+  SITE_DIR: /usr/share/nginx/html # Folder nginx serves on the instance
+
+jobs: # Jobs in this workflow
+  build: # Job 1: build the React site (no AWS access needed)
+    runs-on: ubuntu-latest # Run on a GitHub-hosted Ubuntu machine
+    steps: # Steps run in order
+      - uses: actions/checkout@v4 # Download the repo onto the runner
+
+      - uses: actions/setup-node@v4 # Install Node.js on the runner
+        with: # Inputs for the action
+          node-version: 22 # Node.js version used to build
+          cache: npm # Reuse downloaded packages between runs (faster)
+
+      - name: Validate profile.json # Step name shown in the log
+        run: node scripts/validate-profile.mjs # Fail early with a clear message if profile.json has a mistake
+
+      - name: Install dependencies # Step name shown in the log
+        run: npm ci # Install exact versions from package-lock.json
+
+      - name: Build # Step name shown in the log
+        run: npm run build # Vite builds the site into dist/ (commit hash comes from GITHUB_SHA)
+
+      - uses: actions/upload-artifact@v4 # Save dist/ so the deploy job can use it
+        with: # Inputs for the action
+          name: site # Artifact name
+          path: dist/ # Folder to save
+          retention-days: 7 # Delete the artifact after a week
+
+  deploy: # Job 2: create/update the EC2 stack and copy the site to it
+    needs: build # Only runs if the build succeeded
+    runs-on: ubuntu-latest # Run on a GitHub-hosted Ubuntu machine
+    env: # Variables for this job only
+      SSH_OPTS: -i ec2-key.pem -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o LogLevel=ERROR # Use the key file, skip the "trust this host?" prompt, give up on a dead host after 10s
+    steps: # Steps run in order
+      - uses: actions/checkout@v4 # Download the repo (needed for the template)
+
+      - name: Configure AWS credentials # Step name shown in the log
+        uses: aws-actions/configure-aws-credentials@v4 # Official AWS action that sets up CLI credentials
+        with: # Inputs for the action
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }} # Sandbox access key from repo secrets
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }} # Sandbox secret key from repo secrets
+          aws-region: ${{ env.AWS_REGION }} # Region from the env block
+
+      - name: Validate template # Step name shown in the log
+        run: aws cloudformation validate-template --template-body file://${{ env.TEMPLATE }} # Check the template for syntax errors before deploying
+
+      - name: Deploy stack # Step name shown in the log
+        run: | # Multi-line shell script
+          args=(
+            --stack-name "$STACK_NAME"       # Stack to create or update
+            --template-file "$TEMPLATE"      # Template file to deploy
+            --parameter-overrides InstanceType="${{ inputs.instance_type || 't2.micro' }}" # Instance size from manual input, t2.micro on push
+            --no-fail-on-empty-changeset     # Don't fail if nothing changed (a profile-only change keeps the same instance)
+          )
+          aws cloudformation deploy "${args[@]}" # Create the stack, or update it if it exists
+
+      - name: Find instance and current public IP # Step name shown in the log
+        id: instance # Lets later steps read this step's outputs
+        run: | # Multi-line shell script
+          output() { aws cloudformation describe-stacks --stack-name "$STACK_NAME" --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; } # Read one stack output by name
+          INSTANCE_ID=$(output InstanceId) # EC2 instance created by the stack
+          KEY_ID=$(output KeyPairId) # Needed to fetch the private key from SSM
+
+          STATE=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --query "Reservations[0].Instances[0].State.Name" --output text) # running / stopped / ...
+          echo "Instance $INSTANCE_ID is $STATE" # Show the state in the log
+          if [ "$STATE" = "stopping" ]; then aws ec2 wait instance-stopped --instance-ids "$INSTANCE_ID"; STATE=stopped; fi # Let a stop finish before starting again
+          if [ "$STATE" = "stopped" ]; then aws ec2 start-instances --instance-ids "$INSTANCE_ID" > /dev/null; fi # Start it if the sandbox stopped it
+          aws ec2 wait instance-running --instance-ids "$INSTANCE_ID" # Wait until it is running
+
+          IP=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --query "Reservations[0].Instances[0].PublicIpAddress" --output text) # Current IP (changes after a stop/start)
+          echo "ip=$IP" >> "$GITHUB_OUTPUT" # Share the IP with later steps
+          echo "key_id=$KEY_ID" >> "$GITHUB_OUTPUT" # Share the key pair ID with later steps
+
+      - name: Get SSH key from SSM # Step name shown in the log
+        run: | # Multi-line shell script
+          aws ssm get-parameter --name "/ec2/keypair/${{ steps.instance.outputs.key_id }}" --with-decryption --query Parameter.Value --output text > ec2-key.pem # Private key created by CloudFormation
+          chmod 600 ec2-key.pem # ssh refuses keys that other users can read
+
+      - name: Wait for SSH and first-boot setup # Step name shown in the log
+        env: # Variables for this step
+          IP: ${{ steps.instance.outputs.ip }} # Instance IP from the earlier step
+        run: | # Multi-line shell script
+          for i in $(seq 1 30); do # Try for up to ~5 minutes (a new instance needs time to boot)
+            ssh $SSH_OPTS ec2-user@"$IP" true && break # Stop retrying once SSH works
+            echo "SSH not ready yet ($i/30), retrying in 10s..." # Progress message
+            sleep 10 # Wait before the next try
+          done
+          status=0 # Exit code of cloud-init (0 = done, 1 = failed, 2 = done with warnings)
+          ssh $SSH_OPTS ec2-user@"$IP" 'cloud-init status --wait' || status=$? # Wait until UserData (nginx install) has finished
+          if [ "$status" -eq 1 ]; then # UserData failed
+            echo "::error::UserData failed on the instance. Last lines of its log:" # Red annotation on the run page
+            ssh $SSH_OPTS ec2-user@"$IP" 'sudo tail -n 40 /var/log/cloud-init-output.log' # Show why, so nobody has to SSH in
+            exit 1 # Fail the step
+          fi
+
+      - uses: actions/download-artifact@v4 # Get the dist/ folder from the build job
+        with: # Inputs for the action
+          name: site # Artifact name used in the build job
+          path: dist # Where to put it
+
+      - name: Copy site to EC2 # Step name shown in the log
+        env: # Variables for this step
+          IP: ${{ steps.instance.outputs.ip }} # Instance IP from the earlier step
+        run: | # Multi-line shell script
+          tar -czf site.tar.gz -C dist . # Pack the build into one file (faster than copying many small files)
+          scp $SSH_OPTS site.tar.gz ec2-user@"$IP":/tmp/site.tar.gz # Copy it to the instance
+          ssh $SSH_OPTS ec2-user@"$IP" "rm -rf $SITE_DIR/* && tar -xzf /tmp/site.tar.gz -C $SITE_DIR && rm /tmp/site.tar.gz" # Replace the old site with the new one
+
+      - name: Check the site is live # Step name shown in the log
+        run: curl -fsS --retry 5 --retry-delay 3 "http://${{ steps.instance.outputs.ip }}" | grep -q 'id="root"' # Fail if nginx doesn't serve the React page
+
+      - name: Show outputs # Step name shown in the log
+        run: | # Multi-line shell script
+          echo "### Live at http://${{ steps.instance.outputs.ip }}" >> "$GITHUB_STEP_SUMMARY" # Clickable site URL at the top of the run summary
+          aws cloudformation describe-stacks --stack-name "$STACK_NAME" --query "Stacks[0].Outputs" --output table | tee -a "$GITHUB_STEP_SUMMARY" # Print stack outputs to the log and the run summary page
+
+      - name: Remove SSH key # Step name shown in the log
+        if: always() # Run even if an earlier step failed
+        run: rm -f ec2-key.pem # Don't leave the private key on the runner

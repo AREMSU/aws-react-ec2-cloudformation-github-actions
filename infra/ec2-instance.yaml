@@ -1,0 +1,83 @@
+AWSTemplateFormatVersion: "2010-09-09" # CloudFormation template format version (the only valid value)
+Description: Single EC2 instance (Amazon Linux 2023) running nginx to host a React site, with an auto-created key pair and SSH/HTTP security group. # Shown in the CloudFormation console
+
+Parameters: # Inputs that can be changed at deploy time
+  InstanceType: # Parameter for the EC2 size
+    Type: String # Value is plain text
+    Default: t2.micro # Used when no value is passed (free-tier size)
+    AllowedValues: [t2.micro, t2.small, t2.medium, t3.micro, t3.small, t3.medium] # Only these sizes are accepted (lab-friendly)
+    Description: EC2 instance size. # Help text shown in the console
+  SSHLocation: # Parameter for who can SSH in
+    Type: String # Value is plain text
+    Default: 0.0.0.0/0 # Allows SSH from any IP; change to your-ip/32 to restrict
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$' # Must look like a CIDR, e.g. 1.2.3.4/32
+    Description: CIDR allowed to SSH to the instance. Restrict to your IP (x.x.x.x/32) where possible. # Help text shown in the console
+  LatestAmiId: # Parameter for the OS image
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id> # Reads the AMI ID from an SSM parameter at deploy time
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 # AWS public parameter that always points to the latest Amazon Linux 2023 AMI
+    Description: Public SSM parameter resolving to the latest Amazon Linux 2023 AMI. # Help text shown in the console
+
+Resources: # AWS resources this stack creates
+  KeyPair: # Logical name of the SSH key pair
+    Type: AWS::EC2::KeyPair # Creates an EC2 key pair; private key is saved in SSM at /ec2/keypair/<KeyPairId>
+    Properties: # Settings for the key pair
+      KeyName: !Sub "${AWS::StackName}-key" # Key name built from the stack name, e.g. ec2-lab-stack-key
+
+  SecurityGroup: # Logical name of the firewall
+    Type: AWS::EC2::SecurityGroup # Creates a security group in the default VPC
+    Properties: # Settings for the security group
+      GroupDescription: Allow SSH and HTTP # Required description text
+      SecurityGroupIngress: # Inbound rules
+        - IpProtocol: tcp # Rule 1 uses TCP
+          FromPort: 22 # Start of port range: SSH
+          ToPort: 22 # End of port range: SSH only
+          CidrIp: !Ref SSHLocation # Allowed source IPs come from the SSHLocation parameter
+        - IpProtocol: tcp # Rule 2 uses TCP
+          FromPort: 80 # Start of port range: HTTP
+          ToPort: 80 # End of port range: HTTP only
+          CidrIp: 0.0.0.0/0 # Anyone can reach port 80
+
+  Instance: # Logical name of the EC2 instance
+    Type: AWS::EC2::Instance # Creates an EC2 virtual machine
+    Properties: # Settings for the instance
+      ImageId: !Ref LatestAmiId # OS image = latest Amazon Linux 2023 from the parameter
+      InstanceType: !Ref InstanceType # Size comes from the InstanceType parameter
+      KeyName: !Ref KeyPair # Attaches the key pair above so we can SSH in
+      BlockDeviceMappings: # Root disk settings (set explicitly because the lab policy blocked the default gp3 disk)
+        - DeviceName: /dev/xvda # Root device name used by Amazon Linux
+          Ebs: # The disk is an EBS volume
+            VolumeType: gp2 # gp2 disk type (lab policy denied the default gp3)
+            VolumeSize: 8 # Disk size in GB
+            DeleteOnTermination: true # Delete the disk when the instance is deleted
+      SecurityGroupIds: # Security groups attached to the instance
+        - !GetAtt SecurityGroup.GroupId # Uses the security group created above
+      UserData: # Script that runs once, on the instance's first boot
+        Fn::Base64: | # EC2 expects the script base64-encoded; "|" keeps the lines as written
+          #!/bin/bash
+          set -euo pipefail                             # Stop on the first error (shows in /var/log/cloud-init-output.log)
+          dnf install -y nginx                          # Install the nginx web server
+          chown -R ec2-user:ec2-user /usr/share/nginx/html  # Let ec2-user (the workflow's SSH user) replace the site files without sudo
+          systemctl enable --now nginx                  # Start nginx now and on every reboot
+      Tags: # Labels on the instance
+        - Key: Name # The "Name" tag is what the EC2 console shows
+          Value: !Sub "${AWS::StackName}-instance" # e.g. ec2-lab-stack-instance
+
+Outputs: # Values shown after deployment (printed by the workflow)
+  InstanceId: # Output name
+    Description: EC2 instance ID # What this output is
+    Value: !Ref Instance # Returns the instance ID
+  PublicIp: # Output name
+    Description: Public IP of the instance # What this output is
+    Value: !GetAtt Instance.PublicIp # Returns the public IP, used for SSH
+  PublicDns: # Output name
+    Description: Public DNS name of the instance # What this output is
+    Value: !GetAtt Instance.PublicDnsName # Returns the public DNS name
+  KeyPairId: # Output name
+    Description: Key pair ID; the private key is stored in SSM Parameter Store at /ec2/keypair/<KeyPairId> # What this output is
+    Value: !GetAtt KeyPair.KeyPairId # Returns the key pair ID, needed to fetch the private key
+  KeyName: # Output name
+    Description: Name of the EC2 key pair # What this output is
+    Value: !Ref KeyPair # Returns the key pair name
+  WebsiteURL: # Output name
+    Description: URL of the React site (the IP changes if the instance is stopped and started; the workflow always prints the current one) # What this output is
+    Value: !Sub "http://${Instance.PublicIp}" # Builds the URL from the public IP
