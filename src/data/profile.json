@@ -4,7 +4,7 @@
   "photo": "profile.png",
   "roll": "4447",
   "department": "Computer Engineering",
-  "year": "2024",
+  "year": "2020",
   "email": "bhattsameer4447@gmail.com",
   "gpa": "4.00",
   "about": "I automate things so I don't have to do them twice, then spend three hours debugging the automation. My pipelines are green, my coffee is strong, and \"it works on my machine\" is no longer an excuse, because I put my machine in a Docker container.",
