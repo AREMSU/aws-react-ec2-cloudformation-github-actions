@@ -1,6 +1,6 @@
 {
   "name": "Sammy",
-  "tagline": "DevOps & Cloud Engineer in the making",
+  "tagline": "DevOps & Cloud Engineer in the making ",
   "photo": "profile.png",
   "roll": "4447",
   "department": "Computer Engineering",
@@ -11,7 +11,7 @@
   "skills": ["Linux", "Git", "GitHub Actions", "Docker", "Jenkins", "AWS", "CloudFormation", "Nginx", "React"],
   "links": {
     "github": "https://github.com/Sammy4447",
-    "linkedin": ""
+    "linkedin": "www.linkedin.com/in/er-sameer-bhatt-905562232"
   },
   "quotes": [
     "Stay hungry, stay foolish.",
